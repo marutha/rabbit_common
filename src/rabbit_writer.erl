@@ -10,21 +10,63 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_writer).
+
+%% This module backs writer processes ("writers"). The responsibility of
+%% a writer is to serialise protocol methods and write them to the socket.
+%% Every writer is associated with a channel and normally it's the channel
+%% that delegates method delivery to it. However, rabbit_reader
+%% (connection process) can use this module's functions to send data
+%% on channel 0, which is only used for connection negotiation and
+%% other "special" purposes.
+%%
+%% This module provides multiple functions that send protocol commands,
+%% including some that are credit flow-aware.
+%%
+%% Writers perform internal buffering. When the amount of data
+%% buffered exceeds a threshold, a socket flush is performed.
+%% See FLUSH_THRESHOLD for details.
+%%
+%% When a socket write fails, writer will exit.
+
 -include("rabbit.hrl").
 -include("rabbit_framing.hrl").
 
--export([start/5, start_link/5, mainloop/2, mainloop1/2]).
+-export([start/6, start_link/6, start/7, start_link/7]).
+
+-export([system_continue/3, system_terminate/4, system_code_change/4]).
+
 -export([send_command/2, send_command/3,
          send_command_sync/2, send_command_sync/3,
-         send_command_and_notify/4, send_command_and_notify/5]).
+         send_command_and_notify/4, send_command_and_notify/5,
+         send_command_flow/2, send_command_flow/3,
+         flush/1]).
 -export([internal_send_command/4, internal_send_command/6]).
 
--record(wstate, {sock, channel, frame_max, protocol, pending}).
+%% internal
+-export([enter_mainloop/2, mainloop/2, mainloop1/2]).
+
+-record(wstate, {
+    %% socket (port)
+    sock,
+    %% channel number
+    channel,
+    %% connection-negotiated frame_max setting
+    frame_max,
+    %% see #connection.protocol in rabbit_reader
+    protocol,
+    %% connection (rabbit_reader) process
+    reader,
+    %% statistics emission timer
+    stats_timer,
+    %% data pending delivery (between socket
+    %% flushes)
+    pending
+}).
 
 -define(HIBERNATE_AFTER, 5000).
 
@@ -32,14 +74,31 @@
 
 -ifdef(use_specs).
 
--spec(start/5 ::
+-spec(start/6 ::
         (rabbit_net:socket(), rabbit_channel:channel_number(),
-         non_neg_integer(), rabbit_types:protocol(), pid())
+         non_neg_integer(), rabbit_types:protocol(), pid(),
+         rabbit_types:proc_name())
         -> rabbit_types:ok(pid())).
--spec(start_link/5 ::
+-spec(start_link/6 ::
         (rabbit_net:socket(), rabbit_channel:channel_number(),
-         non_neg_integer(), rabbit_types:protocol(), pid())
+         non_neg_integer(), rabbit_types:protocol(), pid(),
+         rabbit_types:proc_name())
         -> rabbit_types:ok(pid())).
+-spec(start/7 ::
+        (rabbit_net:socket(), rabbit_channel:channel_number(),
+         non_neg_integer(), rabbit_types:protocol(), pid(),
+         rabbit_types:proc_name(), boolean())
+        -> rabbit_types:ok(pid())).
+-spec(start_link/7 ::
+        (rabbit_net:socket(), rabbit_channel:channel_number(),
+         non_neg_integer(), rabbit_types:protocol(), pid(),
+         rabbit_types:proc_name(), boolean())
+        -> rabbit_types:ok(pid())).
+
+-spec(system_code_change/4 :: (_,_,_,_) -> {'ok',_}).
+-spec(system_continue/3 :: (_,_,#wstate{}) -> any()).
+-spec(system_terminate/4 :: (_,_,_,_) -> none()).
+
 -spec(send_command/2 ::
         (pid(), rabbit_framing:amqp_method_record()) -> 'ok').
 -spec(send_command/3 ::
@@ -57,6 +116,12 @@
         (pid(), pid(), pid(), rabbit_framing:amqp_method_record(),
          rabbit_types:content())
         -> 'ok').
+-spec(send_command_flow/2 ::
+        (pid(), rabbit_framing:amqp_method_record()) -> 'ok').
+-spec(send_command_flow/3 ::
+        (pid(), rabbit_framing:amqp_method_record(), rabbit_types:content())
+        -> 'ok').
+-spec(flush/1 :: (pid()) -> 'ok').
 -spec(internal_send_command/4 ::
         (rabbit_net:socket(), rabbit_channel:channel_number(),
          rabbit_framing:amqp_method_record(), rabbit_types:protocol())
@@ -67,63 +132,106 @@
          non_neg_integer(), rabbit_types:protocol())
         -> 'ok').
 
--spec(mainloop/2 :: (_,_) -> 'done').
--spec(mainloop1/2 :: (_,_) -> any()).
-
 -endif.
 
 %%---------------------------------------------------------------------------
 
-start(Sock, Channel, FrameMax, Protocol, ReaderPid) ->
-    {ok,
-     proc_lib:spawn(?MODULE, mainloop, [ReaderPid,
-                                        #wstate{sock = Sock,
-                                                channel = Channel,
-                                                frame_max = FrameMax,
-                                                protocol = Protocol,
-                                                pending = []}])}.
+start(Sock, Channel, FrameMax, Protocol, ReaderPid, Identity) ->
+    start(Sock, Channel, FrameMax, Protocol, ReaderPid, Identity, false).
 
-start_link(Sock, Channel, FrameMax, Protocol, ReaderPid) ->
-    {ok,
-     proc_lib:spawn_link(?MODULE, mainloop, [ReaderPid,
-                                             #wstate{sock = Sock,
-                                                     channel = Channel,
-                                                     frame_max = FrameMax,
-                                                     protocol = Protocol,
-                                                     pending = []}])}.
+start_link(Sock, Channel, FrameMax, Protocol, ReaderPid, Identity) ->
+    start_link(Sock, Channel, FrameMax, Protocol, ReaderPid, Identity, false).
 
-mainloop(ReaderPid, State) ->
+start(Sock, Channel, FrameMax, Protocol, ReaderPid, Identity,
+      ReaderWantsStats) ->
+    State = initial_state(Sock, Channel, FrameMax, Protocol, ReaderPid,
+                          ReaderWantsStats),
+    {ok, proc_lib:spawn(?MODULE, enter_mainloop, [Identity, State])}.
+
+start_link(Sock, Channel, FrameMax, Protocol, ReaderPid, Identity,
+           ReaderWantsStats) ->
+    State = initial_state(Sock, Channel, FrameMax, Protocol, ReaderPid,
+                          ReaderWantsStats),
+    {ok, proc_lib:spawn_link(?MODULE, enter_mainloop, [Identity, State])}.
+
+initial_state(Sock, Channel, FrameMax, Protocol, ReaderPid, ReaderWantsStats) ->
+    (case ReaderWantsStats of
+         true  -> fun rabbit_event:init_stats_timer/2;
+         false -> fun rabbit_event:init_disabled_stats_timer/2
+     end)(#wstate{sock      = Sock,
+                  channel   = Channel,
+                  frame_max = FrameMax,
+                  protocol  = Protocol,
+                  reader    = ReaderPid,
+                  pending   = []},
+          #wstate.stats_timer).
+
+system_continue(Parent, Deb, State) ->
+    mainloop(Deb, State#wstate{reader = Parent}).
+
+system_terminate(Reason, _Parent, _Deb, _State) ->
+    exit(Reason).
+
+system_code_change(Misc, _Module, _OldVsn, _Extra) ->
+    {ok, Misc}.
+
+enter_mainloop(Identity, State) ->
+    Deb = sys:debug_options([]),
+    ?store_proc_name(Identity),
+    mainloop(Deb, State).
+
+mainloop(Deb, State) ->
     try
-        mainloop1(ReaderPid, State)
+        mainloop1(Deb, State)
     catch
-        exit:Error -> ReaderPid ! {channel_exit, #wstate.channel, Error}
+        exit:Error -> #wstate{reader = ReaderPid, channel = Channel} = State,
+                      ReaderPid ! {channel_exit, Channel, Error}
     end,
     done.
 
-mainloop1(ReaderPid, State = #wstate{pending = []}) ->
+mainloop1(Deb, State = #wstate{pending = []}) ->
     receive
-        Message -> ?MODULE:mainloop1(ReaderPid, handle_message(Message, State))
+        Message -> {Deb1, State1} = handle_message(Deb, Message, State),
+                   ?MODULE:mainloop1(Deb1, State1)
     after ?HIBERNATE_AFTER ->
-            erlang:hibernate(?MODULE, mainloop, [ReaderPid, State])
+            erlang:hibernate(?MODULE, mainloop, [Deb, State])
     end;
-mainloop1(ReaderPid, State) ->
+mainloop1(Deb, State) ->
     receive
-        Message -> ?MODULE:mainloop1(ReaderPid, handle_message(Message, State))
+        Message -> {Deb1, State1} = handle_message(Deb, Message, State),
+                   ?MODULE:mainloop1(Deb1, State1)
     after 0 ->
-            ?MODULE:mainloop1(ReaderPid, flush(State))
+            ?MODULE:mainloop1(Deb, internal_flush(State))
     end.
+
+handle_message(Deb, {system, From, Req}, State = #wstate{reader = Parent}) ->
+    sys:handle_system_msg(Req, From, Parent, ?MODULE, Deb, State);
+handle_message(Deb, Message, State) ->
+    {Deb, handle_message(Message, State)}.
 
 handle_message({send_command, MethodRecord}, State) ->
     internal_send_command_async(MethodRecord, State);
 handle_message({send_command, MethodRecord, Content}, State) ->
     internal_send_command_async(MethodRecord, Content, State);
+handle_message({send_command_flow, MethodRecord, Sender}, State) ->
+    credit_flow:ack(Sender),
+    internal_send_command_async(MethodRecord, State);
+handle_message({send_command_flow, MethodRecord, Content, Sender}, State) ->
+    credit_flow:ack(Sender),
+    internal_send_command_async(MethodRecord, Content, State);
 handle_message({'$gen_call', From, {send_command_sync, MethodRecord}}, State) ->
-    State1 = flush(internal_send_command_async(MethodRecord, State)),
+    State1 = internal_flush(
+               internal_send_command_async(MethodRecord, State)),
     gen_server:reply(From, ok),
     State1;
 handle_message({'$gen_call', From, {send_command_sync, MethodRecord, Content}},
                State) ->
-    State1 = flush(internal_send_command_async(MethodRecord, Content, State)),
+    State1 = internal_flush(
+               internal_send_command_async(MethodRecord, Content, State)),
+    gen_server:reply(From, ok),
+    State1;
+handle_message({'$gen_call', From, flush}, State) ->
+    State1 = internal_flush(State),
     gen_server:reply(From, ok),
     State1;
 handle_message({send_command_and_notify, QPid, ChPid, MethodRecord}, State) ->
@@ -139,9 +247,12 @@ handle_message({'DOWN', _MRef, process, QPid, _Reason}, State) ->
     rabbit_amqqueue:notify_sent_queue_down(QPid),
     State;
 handle_message({inet_reply, _, ok}, State) ->
-    State;
+    rabbit_event:ensure_stats_timer(State, #wstate.stats_timer, emit_stats);
 handle_message({inet_reply, _, Status}, _State) ->
     exit({writer, send_failed, Status});
+handle_message(emit_stats, State = #wstate{reader = ReaderPid}) ->
+    ReaderPid ! ensure_stats,
+    rabbit_event:reset_stats_timer(State, #wstate.stats_timer);
 handle_message(Message, _State) ->
     exit({writer, message_not_understood, Message}).
 
@@ -153,6 +264,16 @@ send_command(W, MethodRecord) ->
 
 send_command(W, MethodRecord, Content) ->
     W ! {send_command, MethodRecord, Content},
+    ok.
+
+send_command_flow(W, MethodRecord) ->
+    credit_flow:send(W),
+    W ! {send_command_flow, MethodRecord, self()},
+    ok.
+
+send_command_flow(W, MethodRecord, Content) ->
+    credit_flow:send(W),
+    W ! {send_command_flow, MethodRecord, Content, self()},
     ok.
 
 send_command_sync(W, MethodRecord) ->
@@ -168,6 +289,8 @@ send_command_and_notify(W, Q, ChPid, MethodRecord) ->
 send_command_and_notify(W, Q, ChPid, MethodRecord, Content) ->
     W ! {send_command_and_notify, Q, ChPid, MethodRecord, Content},
     ok.
+
+flush(W) -> call(W, flush).
 
 %%---------------------------------------------------------------------------
 
@@ -218,23 +341,27 @@ internal_send_command_async(MethodRecord, Content,
                                             pending   = Pending}) ->
     Frames = assemble_frames(Channel, MethodRecord, Content, FrameMax,
                              Protocol),
+    rabbit_basic:maybe_gc_large_msg(Content),
     maybe_flush(State#wstate{pending = [Frames | Pending]}).
 
+%% When the amount of protocol method data buffered exceeds
+%% this threshold, a socket flush is performed.
+%%
 %% This magic number is the tcp-over-ethernet MSS (1460) minus the
-%% minimum size of a AMQP basic.deliver method frame (24) plus basic
+%% minimum size of a AMQP 0-9-1 basic.deliver method frame (24) plus basic
 %% content header (22). The idea is that we want to flush just before
 %% exceeding the MSS.
 -define(FLUSH_THRESHOLD, 1414).
 
 maybe_flush(State = #wstate{pending = Pending}) ->
     case iolist_size(Pending) >= ?FLUSH_THRESHOLD of
-        true  -> flush(State);
+        true  -> internal_flush(State);
         false -> State
     end.
 
-flush(State = #wstate{pending = []}) ->
+internal_flush(State = #wstate{pending = []}) ->
     State;
-flush(State = #wstate{sock = Sock, pending = Pending}) ->
+internal_flush(State = #wstate{sock = Sock, pending = Pending}) ->
     ok = port_cmd(Sock, lists:reverse(Pending)),
     State#wstate{pending = []}.
 

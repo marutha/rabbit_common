@@ -1,7 +1,13 @@
-{application, rabbit_common,
- [{description, "RabbitMQ Common Libraries"},
-  {vsn, "2.8.1"},
-  {modules, []},
-  {registered, []},
-  {env, []},
-  {applications, [kernel, stdlib]}]}.
+% vim:ft=erlang:
+
+{application, rabbit_common, [
+	{description, ""},
+	{vsn, ""},
+	{id, "git"},
+	{modules, []},
+	{registered, []},
+	{applications, [
+		kernel,
+		stdlib
+	]}
+]}.

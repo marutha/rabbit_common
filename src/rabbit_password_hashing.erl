@@ -10,16 +10,24 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is Pivotal Software, Inc.
-%% Copyright (c) 2007-2015 Pivotal Software, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
 %%
 
+-module(rabbit_password_hashing).
 -include("rabbit.hrl").
 
 -ifdef(use_specs).
 
--type(msg() :: any()).
+-callback hash(rabbit_types:password()) -> rabbit_types:password_hash().
+
+-else.
+
+-export([behaviour_info/1]).
+
+behaviour_info(callbacks) ->
+    [{hash, 1}];
+behaviour_info(_Other) ->
+    undefined.
 
 -endif.
-
--record(msg_location, {msg_id, ref_count, file, offset, total_size}).

@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_auth_mechanism).
@@ -19,7 +19,7 @@
 -ifdef(use_specs).
 
 %% A description.
--callback description() -> [proplist:property()].
+-callback description() -> [proplists:property()].
 
 %% If this mechanism is enabled, should it be offered for a given socket?
 %% (primarily so EXTERNAL can be SSL-only)
@@ -36,13 +36,13 @@
 %%     Another round is needed. Here's the state I want next time.
 %% {protocol_error, Msg, Args}
 %%     Client got the protocol wrong. Log and die.
-%% {refused, Msg, Args}
+%% {refused, Username, Msg, Args}
 %%     Client failed authentication. Log and die.
 -callback handle_response(binary(), any()) ->
     {'ok', rabbit_types:user()} |
     {'challenge', binary(), any()} |
     {'protocol_error', string(), [any()]} |
-    {'refused', string(), [any()]}.
+    {'refused', rabbit_types:username() | none, string(), [any()]}.
 
 -else.
 

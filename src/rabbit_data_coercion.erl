@@ -10,16 +10,13 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is Pivotal Software, Inc.
-%% Copyright (c) 2007-2015 Pivotal Software, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
 %%
 
--include("rabbit.hrl").
+-module(rabbit_data_coercion).
 
--ifdef(use_specs).
+-export([to_binary/1]).
 
--type(msg() :: any()).
-
--endif.
-
--record(msg_location, {msg_id, ref_count, file, offset, total_size}).
+to_binary(Val) when is_list(Val) -> list_to_binary(Val);
+to_binary(Val)                   -> Val.

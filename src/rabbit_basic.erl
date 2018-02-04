@@ -10,18 +10,19 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_basic).
 -include("rabbit.hrl").
 -include("rabbit_framing.hrl").
 
--export([publish/4, publish/6, publish/1,
-         message/3, message/4, properties/1, append_table_header/3,
-         extract_headers/1, map_headers/2, delivery/4, header_routes/1]).
--export([build_content/2, from_content/1]).
+-export([publish/4, publish/5, publish/1,
+         message/3, message/4, properties/1, prepend_table_header/3,
+         extract_headers/1, extract_timestamp/1, map_headers/2, delivery/4,
+         header_routes/1, parse_expiration/1, header/2, header/3]).
+-export([build_content/2, from_content/1, msg_size/1, maybe_gc_large_msg/1]).
 
 %%----------------------------------------------------------------------------
 
@@ -30,8 +31,8 @@
 -type(properties_input() ::
         (rabbit_framing:amqp_property_record() | [{atom(), any()}])).
 -type(publish_result() ::
-        ({ok, rabbit_amqqueue:routing_result(), [pid()]}
-         | rabbit_types:error('not_found'))).
+        ({ok, [pid()]} | rabbit_types:error('not_found'))).
+-type(header() :: any()).
 -type(headers() :: rabbit_framing:amqp_table() | 'undefined').
 
 -type(exchange_input() :: (rabbit_types:exchange() | rabbit_exchange:name())).
@@ -40,8 +41,8 @@
 -spec(publish/4 ::
         (exchange_input(), rabbit_router:routing_key(), properties_input(),
          body_input()) -> publish_result()).
--spec(publish/6 ::
-        (exchange_input(), rabbit_router:routing_key(), boolean(), boolean(),
+-spec(publish/5 ::
+        (exchange_input(), rabbit_router:routing_key(), boolean(),
          properties_input(), body_input()) -> publish_result()).
 -spec(publish/1 ::
         (rabbit_types:delivery()) -> publish_result()).
@@ -58,8 +59,13 @@
 -spec(properties/1 ::
         (properties_input()) -> rabbit_framing:amqp_property_record()).
 
--spec(append_table_header/3 ::
+-spec(prepend_table_header/3 ::
         (binary(), rabbit_framing:amqp_table(), headers()) -> headers()).
+
+-spec(header/2 ::
+        (header(), headers()) -> 'undefined' | any()).
+-spec(header/3 ::
+        (header(), headers(), any()) -> 'undefined' | any()).
 
 -spec(extract_headers/1 :: (rabbit_types:content()) -> headers()).
 
@@ -72,6 +78,15 @@
                           binary() | [binary()]) -> rabbit_types:content()).
 -spec(from_content/1 :: (rabbit_types:content()) ->
                              {rabbit_framing:amqp_property_record(), binary()}).
+-spec(parse_expiration/1 ::
+        (rabbit_framing:amqp_property_record())
+        -> rabbit_types:ok_or_error2('undefined' | non_neg_integer(), any())).
+
+-spec(msg_size/1 :: (rabbit_types:content() | rabbit_types:message()) ->
+                         non_neg_integer()).
+
+-spec(maybe_gc_large_msg/1 ::
+        (rabbit_types:content() | rabbit_types:message()) -> non_neg_integer()).
 
 -endif.
 
@@ -80,18 +95,16 @@
 %% Convenience function, for avoiding round-trips in calls across the
 %% erlang distributed network.
 publish(Exchange, RoutingKeyBin, Properties, Body) ->
-    publish(Exchange, RoutingKeyBin, false, false, Properties, Body).
+    publish(Exchange, RoutingKeyBin, false, Properties, Body).
 
 %% Convenience function, for avoiding round-trips in calls across the
 %% erlang distributed network.
-publish(X = #exchange{name = XName}, RKey, Mandatory, Immediate, Props, Body) ->
-    publish(X, delivery(Mandatory, Immediate,
-                        message(XName, RKey, properties(Props), Body),
-                        undefined));
-publish(XName, RKey, Mandatory, Immediate, Props, Body) ->
-    publish(delivery(Mandatory, Immediate,
-                     message(XName, RKey, properties(Props), Body),
-                     undefined)).
+publish(X = #exchange{name = XName}, RKey, Mandatory, Props, Body) ->
+    Message = message(XName, RKey, properties(Props), Body),
+    publish(X, delivery(Mandatory, false, Message, undefined));
+publish(XName, RKey, Mandatory, Props, Body) ->
+    Message = message(XName, RKey, properties(Props), Body),
+    publish(delivery(Mandatory, false, Message, undefined)).
 
 publish(Delivery = #delivery{
           message = #basic_message{exchange_name = XName}}) ->
@@ -102,12 +115,12 @@ publish(Delivery = #delivery{
 
 publish(X, Delivery) ->
     Qs = rabbit_amqqueue:lookup(rabbit_exchange:route(X, Delivery)),
-    {RoutingRes, DeliveredQPids} = rabbit_amqqueue:deliver(Qs, Delivery),
-    {ok, RoutingRes, DeliveredQPids}.
+    DeliveredQPids = rabbit_amqqueue:deliver(Qs, Delivery),
+    {ok, DeliveredQPids}.
 
-delivery(Mandatory, Immediate, Message, MsgSeqNo) ->
-    #delivery{mandatory = Mandatory, immediate = Immediate, sender = self(),
-              message = Message, msg_seq_no = MsgSeqNo}.
+delivery(Mandatory, Confirm, Message, MsgSeqNo) ->
+    #delivery{mandatory = Mandatory, confirm = Confirm, sender = self(),
+              message = Message, msg_seq_no = MsgSeqNo, flow = noflow}.
 
 build_content(Properties, BodyBin) when is_binary(BodyBin) ->
     build_content(Properties, [BodyBin]);
@@ -179,19 +192,67 @@ properties(P) when is_list(P) ->
                         end
                 end, #'P_basic'{}, P).
 
-append_table_header(Name, Info, undefined) ->
-    append_table_header(Name, Info, []);
-append_table_header(Name, Info, Headers) ->
-    Prior = case rabbit_misc:table_lookup(Headers, Name) of
-                undefined          -> [];
-                {array, Existing}  -> Existing
-            end,
+prepend_table_header(Name, Info, undefined) ->
+    prepend_table_header(Name, Info, []);
+prepend_table_header(Name, Info, Headers) ->
+    case rabbit_misc:table_lookup(Headers, Name) of
+        {array, Existing} ->
+            prepend_table(Name, Info, Existing, Headers);
+        undefined ->
+            prepend_table(Name, Info, [], Headers);
+        Other ->
+            Headers2 = prepend_table(Name, Info, [], Headers),
+            set_invalid_header(Name, Other, Headers2)
+    end.
+
+prepend_table(Name, Info, Prior, Headers) ->
     rabbit_misc:set_table_value(Headers, Name, array, [{table, Info} | Prior]).
+
+set_invalid_header(Name, {_, _}=Value, Headers) when is_list(Headers) ->
+    case rabbit_misc:table_lookup(Headers, ?INVALID_HEADERS_KEY) of
+        undefined ->
+            set_invalid([{Name, array, [Value]}], Headers);
+        {table, ExistingHdr} ->
+            update_invalid(Name, Value, ExistingHdr, Headers);
+        Other ->
+            %% somehow the x-invalid-headers header is corrupt
+            Invalid = [{?INVALID_HEADERS_KEY, array, [Other]}],
+            set_invalid_header(Name, Value, set_invalid(Invalid, Headers))
+    end.
+
+set_invalid(NewHdr, Headers) ->
+    rabbit_misc:set_table_value(Headers, ?INVALID_HEADERS_KEY, table, NewHdr).
+
+update_invalid(Name, Value, ExistingHdr, Header) ->
+    Values = case rabbit_misc:table_lookup(ExistingHdr, Name) of
+                 undefined      -> [Value];
+                 {array, Prior} -> [Value | Prior]
+             end,
+    NewHdr = rabbit_misc:set_table_value(ExistingHdr, Name, array, Values),
+    set_invalid(NewHdr, Header).
+
+header(_Header, undefined) ->
+    undefined;
+header(_Header, []) ->
+    undefined;
+header(Header, Headers) ->
+    header(Header, Headers, undefined).
+
+header(Header, Headers, Default) ->
+    case lists:keysearch(Header, 1, Headers) of
+        false        -> Default;
+        {value, Val} -> Val
+    end.
 
 extract_headers(Content) ->
     #content{properties = #'P_basic'{headers = Headers}} =
         rabbit_binary_parser:ensure_content_decoded(Content),
     Headers.
+
+extract_timestamp(Content) ->
+    #content{properties = #'P_basic'{timestamp = Timestamp}} =
+        rabbit_binary_parser:ensure_content_decoded(Content),
+    Timestamp.
 
 map_headers(F, Content) ->
     Content1 = rabbit_binary_parser:ensure_content_decoded(Content),
@@ -224,6 +285,42 @@ header_routes(HeadersTable) ->
            {array, Routes} -> [Route || {longstr, Route} <- Routes];
            undefined       -> [];
            {Type, _Val}    -> throw({error, {unacceptable_type_in_header,
-                                             Type,
-                                             binary_to_list(HeaderKey)}})
+                                             binary_to_list(HeaderKey), Type}})
        end || HeaderKey <- ?ROUTING_HEADERS]).
+
+parse_expiration(#'P_basic'{expiration = undefined}) ->
+    {ok, undefined};
+parse_expiration(#'P_basic'{expiration = Expiration}) ->
+    case string:to_integer(binary_to_list(Expiration)) of
+        {error, no_integer} = E ->
+            E;
+        {N, ""} ->
+            case rabbit_misc:check_expiry(N) of
+                ok             -> {ok, N};
+                E = {error, _} -> E
+            end;
+        {_, S} ->
+            {error, {leftover_string, S}}
+    end.
+
+%% Some processes (channel, writer) can get huge amounts of binary
+%% garbage when processing huge messages at high speed (since we only
+%% do enough reductions to GC every few hundred messages, and if each
+%% message is 1MB then that's ugly). So count how many bytes of
+%% message we have processed, and force a GC every so often.
+maybe_gc_large_msg(Content) ->
+    Size = msg_size(Content),
+    Current = case get(msg_size_for_gc) of
+                  undefined -> 0;
+                  C         -> C
+              end,
+    New = Current + Size,
+    put(msg_size_for_gc, case New > 1000000 of
+                             true  -> erlang:garbage_collect(),
+                                      0;
+                             false -> New
+                         end),
+    Size.
+
+msg_size(#content{payload_fragments_rev = PFR}) -> iolist_size(PFR);
+msg_size(#basic_message{content = Content})     -> msg_size(Content).

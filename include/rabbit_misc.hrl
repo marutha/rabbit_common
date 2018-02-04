@@ -10,16 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is Pivotal Software, Inc.
-%% Copyright (c) 2007-2015 Pivotal Software, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
 %%
 
--include("rabbit.hrl").
-
--ifdef(use_specs).
-
--type(msg() :: any()).
-
--endif.
-
--record(msg_location, {msg_id, ref_count, file, offset, total_size}).
+-define(RPC_TIMEOUT, infinity).
