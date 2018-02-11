@@ -624,10 +624,7 @@ unregister_name(_Name) -> ok.
 extend_backoff(undefined) ->
     undefined;
 extend_backoff({backoff, InitialTimeout, MinimumTimeout, DesiredHibPeriod}) ->
-    {backoff, InitialTimeout, MinimumTimeout, DesiredHibPeriod,
-      {erlang:phash2([node()]),
-       time_compat:monotonic_time(),
-       time_compat:unique_integer()}}.
+    {backoff, InitialTimeout, MinimumTimeout, DesiredHibPeriod, rand:seed(exsplus, erlang:timestamp())}.
 
 %%%========================================================================
 %%% Internal functions
